@@ -26,8 +26,8 @@ int main()
     try
     {
         // Sync call
-        http::HttpResponse res = client.send(req, "example.com", 80);
-        //http::HttpResponse res = client.send(req, "saucedemo.com", 80);
+        //http::HttpResponse res = client.send(req, "example.com", 80);
+        http::HttpResponse res = client.send(req, "saucedemo.com", 80);
 
         if (res.ok())
         {

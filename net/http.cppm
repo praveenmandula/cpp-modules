@@ -22,12 +22,14 @@ module;
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <future>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -115,6 +117,11 @@ struct HttpResponse
     std::unordered_map<std::string, std::string> headers;
     std::string body;
 
+    void setHeader(std::string name, std::string value)
+    {
+        headers[std::move(name)] = std::move(value);
+    }
+
     [[nodiscard]] bool ok() const
     {
         return statusCode >= 200 && statusCode < 300;
@@ -143,6 +150,8 @@ struct HttpResponse
 };
 
 class Client;
+using HttpHandler = std::function<HttpResponse(const HttpRequest&)>;
+class Server;
 using Http = Client;
 }
 
@@ -1149,6 +1158,222 @@ namespace
         return response;
     }
 
+    bool parseMethodToken(std::string_view token, HttpMethod& method)
+    {
+        if (token == "GET") { method = HttpMethod::Get; return true; }
+        if (token == "POST") { method = HttpMethod::Post; return true; }
+        if (token == "PUT") { method = HttpMethod::Put; return true; }
+        if (token == "DELETE") { method = HttpMethod::Delete_; return true; }
+        if (token == "PATCH") { method = HttpMethod::Patch; return true; }
+        if (token == "HEAD") { method = HttpMethod::Head; return true; }
+        if (token == "OPTIONS") { method = HttpMethod::Options; return true; }
+        return false;
+    }
+
+    std::string reasonPhraseForStatus(int statusCode)
+    {
+        switch (statusCode)
+        {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 202: return "Accepted";
+        case 204: return "No Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 304: return "Not Modified";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 408: return "Request Timeout";
+        case 409: return "Conflict";
+        case 413: return "Payload Too Large";
+        case 415: return "Unsupported Media Type";
+        case 429: return "Too Many Requests";
+        case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        case 504: return "Gateway Timeout";
+        default: return "Unknown";
+        }
+    }
+
+    std::string serializeServerResponse(const HttpResponse& response)
+    {
+        std::ostringstream out;
+        const int code = response.statusCode == 0 ? 200 : response.statusCode;
+        const std::string phrase = response.reasonPhrase.empty() ? reasonPhraseForStatus(code) : response.reasonPhrase;
+
+        out << "HTTP/1.1 " << code << ' ' << phrase << "\r\n";
+
+        bool hasContentLength = false;
+        bool hasConnection = false;
+        bool hasContentType = false;
+
+        for (const auto& [name, value] : response.headers)
+        {
+            out << name << ": " << value << "\r\n";
+            if (iequals(name, "Content-Length"))
+                hasContentLength = true;
+            if (iequals(name, "Connection"))
+                hasConnection = true;
+            if (iequals(name, "Content-Type"))
+                hasContentType = true;
+        }
+
+        if (!hasContentType)
+            out << "Content-Type: text/plain; charset=utf-8\r\n";
+        if (!hasContentLength)
+            out << "Content-Length: " << response.body.size() << "\r\n";
+        if (!hasConnection)
+            out << "Connection: close\r\n";
+
+        out << "\r\n";
+        out << response.body;
+        return out.str();
+    }
+
+    bool receiveServerRequest(SocketHandle socketHandle, HttpRequest& request)
+    {
+        std::string raw;
+        raw.reserve(4096);
+
+        std::size_t headerEnd = std::string::npos;
+        std::size_t lineBreakSize = 4;
+        std::size_t contentLength = 0;
+        bool hasContentLength = false;
+
+        char buffer[4096];
+        for (;;)
+        {
+#if defined(_WIN32)
+            const int result = ::recv(socketHandle, buffer, static_cast<int>(sizeof(buffer)), 0);
+#else
+            const auto result = ::recv(socketHandle, buffer, sizeof(buffer), 0);
+#endif
+            if (result <= 0)
+                return false;
+
+            raw.append(buffer, static_cast<std::size_t>(result));
+
+            if (headerEnd == std::string::npos)
+            {
+                headerEnd = raw.find("\r\n\r\n");
+                lineBreakSize = 4;
+                if (headerEnd == std::string::npos)
+                {
+                    headerEnd = raw.find("\n\n");
+                    lineBreakSize = 2;
+                }
+
+                if (headerEnd != std::string::npos)
+                {
+                    const std::string headerSection = raw.substr(0, headerEnd);
+                    std::istringstream hs(headerSection);
+                    std::string line;
+                    std::getline(hs, line);
+                    while (std::getline(hs, line))
+                    {
+                        if (!line.empty() && line.back() == '\r')
+                            line.pop_back();
+
+                        const auto colon = line.find(':');
+                        if (colon == std::string::npos)
+                            continue;
+
+                        const std::string name = trim(line.substr(0, colon));
+                        const std::string value = trim(line.substr(colon + 1));
+                        if (iequals(name, "Content-Length"))
+                        {
+                            try
+                            {
+                                contentLength = static_cast<std::size_t>(std::stoull(value));
+                                hasContentLength = true;
+                            }
+                            catch (...)
+                            {
+                                return false;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (headerEnd != std::string::npos)
+            {
+                const std::size_t bodyStart = headerEnd + lineBreakSize;
+                if (!hasContentLength || raw.size() >= bodyStart + contentLength)
+                    break;
+            }
+        }
+
+        if (headerEnd == std::string::npos)
+            return false;
+
+        const std::size_t bodyStart = headerEnd + lineBreakSize;
+        const std::string headerSection = raw.substr(0, headerEnd);
+        std::istringstream in(headerSection);
+        std::string firstLine;
+        if (!std::getline(in, firstLine))
+            return false;
+        if (!firstLine.empty() && firstLine.back() == '\r')
+            firstLine.pop_back();
+
+        {
+            std::istringstream fl(firstLine);
+            std::string methodText;
+            std::string target;
+            std::string version;
+            if (!(fl >> methodText >> target >> version))
+                return false;
+
+            if (!parseMethodToken(methodText, request.method))
+                return false;
+
+            request.target = normalizeTarget(target);
+        }
+
+        std::string line;
+        while (std::getline(in, line))
+        {
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+
+            if (line.empty())
+                continue;
+
+            const auto colon = line.find(':');
+            if (colon == std::string::npos)
+                continue;
+
+            const std::string name = trim(line.substr(0, colon));
+            const std::string value = trim(line.substr(colon + 1));
+            request.headers[name] = value;
+        }
+
+        if (hasContentLength)
+            request.body = raw.substr(bodyStart, contentLength);
+        else if (bodyStart < raw.size())
+            request.body = raw.substr(bodyStart);
+
+        return true;
+    }
+
+    void closeSocketHandle(SocketHandle socketHandle)
+    {
+        if (socketHandle == InvalidSocket)
+            return;
+
+#if defined(_WIN32)
+        closesocket(socketHandle);
+#else
+        ::close(socketHandle);
+#endif
+    }
+
     HttpResponse executeOnce(const HttpEndpoint& endpoint,
         const HttpRequest& request,
         std::string_view target,
@@ -1546,5 +1771,226 @@ public:
 private:
     HttpOptions mDefaultOptions{};
     std::string mLastError;
+};
+
+class Server
+{
+public:
+    Server() = default;
+
+    ~Server()
+    {
+        stop();
+    }
+
+    Server(const Server&) = delete;
+    Server& operator=(const Server&) = delete;
+
+    void route(HttpMethod method, std::string target, HttpHandler handler)
+    {
+        if (!handler)
+            return;
+
+        std::lock_guard lock(mRoutesMutex);
+        mRoutes[routeKey(method, normalizeTarget(target))] = std::move(handler);
+    }
+
+    void setNotFoundHandler(HttpHandler handler)
+    {
+        if (!handler)
+            return;
+
+        std::lock_guard lock(mRoutesMutex);
+        mNotFoundHandler = std::move(handler);
+    }
+
+    bool start(std::uint16_t port, std::string bindAddress = "0.0.0.0")
+    {
+        std::lock_guard lock(mStateMutex);
+        if (mRunning)
+            return false;
+
+        mPort = port;
+        mBindAddress = std::move(bindAddress);
+        mRunning = true;
+
+        mWorker = std::thread([this]()
+            {
+                run();
+            });
+
+        return true;
+    }
+
+    void stop()
+    {
+        {
+            std::lock_guard lock(mStateMutex);
+            if (!mRunning)
+                return;
+
+            mRunning = false;
+            closeSocketHandle(mListenSocket);
+            mListenSocket = InvalidSocket;
+        }
+
+        if (mWorker.joinable())
+            mWorker.join();
+    }
+
+    [[nodiscard]] bool isRunning() const noexcept
+    {
+        return mRunning.load();
+    }
+
+private:
+    static std::string routeKey(HttpMethod method, std::string_view target)
+    {
+        return methodToString(method) + " " + std::string(target);
+    }
+
+    HttpResponse dispatch(const HttpRequest& request)
+    {
+        HttpHandler handler;
+        HttpHandler notFound;
+
+        {
+            std::lock_guard lock(mRoutesMutex);
+            const auto it = mRoutes.find(routeKey(request.method, normalizeTarget(request.target)));
+            if (it != mRoutes.end())
+                handler = it->second;
+            notFound = mNotFoundHandler;
+        }
+
+        if (!handler)
+            handler = notFound;
+
+        if (!handler)
+        {
+            HttpResponse response{};
+            response.statusCode = 404;
+            response.reasonPhrase = "Not Found";
+            response.body = "Not Found";
+            response.headers["Content-Type"] = "text/plain; charset=utf-8";
+            return response;
+        }
+
+        return handler(request);
+    }
+
+    void run()
+    {
+        try
+        {
+            SocketSystemGuard socketSystem;
+
+            addrinfo hints{};
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+            hints.ai_flags = AI_PASSIVE;
+
+            const std::string service = std::to_string(mPort);
+            const char* host = mBindAddress.empty() ? nullptr : mBindAddress.c_str();
+
+            addrinfo* addresses = nullptr;
+            if (getaddrinfo(host, service.c_str(), &hints, &addresses) != 0)
+            {
+                mRunning = false;
+                return;
+            }
+
+            struct AddrInfoGuard
+            {
+                addrinfo* value;
+                ~AddrInfoGuard()
+                {
+                    if (value != nullptr)
+                        freeaddrinfo(value);
+                }
+            } addressGuard{ addresses };
+
+            SocketHandle listener = InvalidSocket;
+            for (addrinfo* current = addresses; current != nullptr; current = current->ai_next)
+            {
+                SocketHandle candidate = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
+                if (candidate == InvalidSocket)
+                    continue;
+
+                int reuse = 1;
+#if defined(_WIN32)
+                setsockopt(candidate, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+#else
+                setsockopt(candidate, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
+
+                if (bind(candidate, current->ai_addr, static_cast<int>(current->ai_addrlen)) == 0
+                    && listen(candidate, SOMAXCONN) == 0)
+                {
+                    listener = candidate;
+                    break;
+                }
+
+                closeSocketHandle(candidate);
+            }
+
+            if (listener == InvalidSocket)
+            {
+                mRunning = false;
+                return;
+            }
+
+            {
+                std::lock_guard lock(mStateMutex);
+                mListenSocket = listener;
+            }
+
+            while (mRunning)
+            {
+                sockaddr_storage clientAddr{};
+                socklen_t clientLen = static_cast<socklen_t>(sizeof(clientAddr));
+                SocketHandle client = accept(listener, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
+
+                if (client == InvalidSocket)
+                {
+                    if (!mRunning)
+                        break;
+                    continue;
+                }
+
+                SocketGuard clientGuard(client);
+
+                HttpRequest request{};
+                if (!receiveServerRequest(clientGuard.get(), request))
+                    continue;
+
+                HttpResponse response = dispatch(request);
+                const std::string rawResponse = serializeServerResponse(response);
+                sendAll(clientGuard.get(), rawResponse);
+            }
+        }
+        catch (...)
+        {
+            // Intentionally swallow server loop exceptions; caller can inspect state and restart.
+        }
+
+        std::lock_guard lock(mStateMutex);
+        mRunning = false;
+        closeSocketHandle(mListenSocket);
+        mListenSocket = InvalidSocket;
+    }
+
+private:
+    std::atomic<bool> mRunning{ false };
+    std::thread mWorker;
+
+    std::mutex mStateMutex;
+    SocketHandle mListenSocket = InvalidSocket;
+    std::uint16_t mPort = 0;
+    std::string mBindAddress;
+
+    std::mutex mRoutesMutex;
+    std::unordered_map<std::string, HttpHandler> mRoutes;
+    HttpHandler mNotFoundHandler;
 };
 }
