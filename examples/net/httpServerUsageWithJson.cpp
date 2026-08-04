@@ -57,5 +57,5 @@ int main()
 }
 
 //Quick test with curl :
-//curl - i - X POST http ://localhost:8080/echo-json -H "Content-Type: application/json" -d "{\"name\":\"praveen\"}"
+//curl -i -X POST "http://localhost:8080/echo-json" -H "Content-Type: application/json" -d "{\"name\":\"praveen\"}"
 //You should get JSON back with "handledBy" : "cppm server".
