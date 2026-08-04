@@ -6,6 +6,16 @@ import cppm.core.logger;
 #include <thread>
 #include <iostream>
 
+http::HttpResponse handlePraveen(const http::HttpRequest&)
+{
+    logger::log(logger::LogLevel::Info, "Received request for /praveen");
+    http::HttpResponse r{};
+    r.statusCode = 200;
+    r.body = "Received request for /praveen";
+    r.setHeader("Content-Type", "text/plain; charset=utf-8");
+    return r;
+}
+
 int main()
 {
     http::Server server;
@@ -20,15 +30,7 @@ int main()
             return r;
         });
 
-    server.route(http::HttpMethod::Get, "/praveen", [](const http::HttpRequest&)
-        {
-            logger::log(logger::LogLevel::Info, "Received request for /praveen");
-            http::HttpResponse r{};
-            r.statusCode = 200;
-            r.body = "Received request for /praveen";
-            r.setHeader("Content-Type", "text/plain; charset=utf-8");
-            return r;
-        });
+    server.route(http::HttpMethod::Get, "/praveen", handlePraveen);
 
     server.setNotFoundHandler([](const http::HttpRequest& req)
         {
