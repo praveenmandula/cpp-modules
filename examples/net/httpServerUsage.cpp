@@ -20,6 +20,26 @@ int main()
             return r;
         });
 
+    server.route(http::HttpMethod::Get, "/praveen", [](const http::HttpRequest&)
+        {
+            logger::log(logger::LogLevel::Info, "Received request for /praveen");
+            http::HttpResponse r{};
+            r.statusCode = 200;
+            r.body = "Received request for /praveen";
+            r.setHeader("Content-Type", "text/plain; charset=utf-8");
+            return r;
+        });
+
+    server.setNotFoundHandler([](const http::HttpRequest& req)
+        {
+            logger::log(logger::LogLevel::Error, "No route matched: ", req.target);
+            http::HttpResponse r{};
+            r.statusCode = 404;
+            r.body = "Route not found: " + req.target;
+            r.setHeader("Content-Type", "text/plain; charset=utf-8");
+            return r;
+        });
+
     server.start(8080);
     logger::log(logger::LogLevel::Info, "Server running on :8080");
     logger::log(logger::LogLevel::Info, "Press Enter to stop...");
