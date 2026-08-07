@@ -578,6 +578,39 @@ namespace
         return std::string(host) + ":" + std::to_string(port);
     }
 
+    std::size_t fileContentLength(std::string_view filePath)
+    {
+        if (filePath.empty())
+            return 0;
+
+        return static_cast<std::size_t>(std::filesystem::file_size(std::filesystem::path(filePath)));
+    }
+
+    template <typename WriteFn>
+    void sendRequestPayload(WriteFn&& write, const HttpRequest& request, std::string_view filePath)
+    {
+        if (!request.body.empty())
+            write(std::string_view(request.body));
+
+        if (filePath.empty())
+            return;
+
+        std::ifstream file(std::string(filePath), std::ios::binary);
+        if (!file)
+            throw std::runtime_error("Unable to open upload file: " + std::string(filePath));
+
+        char buffer[8192];
+        while (file.good())
+        {
+            file.read(buffer, sizeof(buffer));
+            const auto count = file.gcount();
+            if (count <= 0)
+                break;
+
+            write(std::string_view(buffer, static_cast<std::size_t>(count)));
+        }
+    }
+
     std::string buildRequestHeaders(const HttpRequest& request,
         std::string_view host,
         std::uint16_t port,
@@ -616,17 +649,17 @@ namespace
 
     void applySocketTimeout(SocketHandle socketHandle, int timeoutMs)
     {
-#if defined(_WIN32)
+    #if defined(_WIN32)
         const DWORD timeout = timeoutMs > 0 ? static_cast<DWORD>(timeoutMs) : 0;
         setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
         setsockopt(socketHandle, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-#else
+    #else
         timeval tv{};
         tv.tv_sec = timeoutMs > 0 ? timeoutMs / 1000 : 0;
         tv.tv_usec = timeoutMs > 0 ? (timeoutMs % 1000) * 1000 : 0;
         setsockopt(socketHandle, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(socketHandle, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
+    #endif
     }
 
     void sendAll(SocketHandle socketHandle, std::string_view data)
@@ -742,27 +775,15 @@ namespace
         SocketSystemGuard socketSystem;
         SocketGuard socketGuard(connectSocket(host, port, timeoutMs));
 
-        std::size_t fileSize = 0;
-        if (!filePath.empty())
-        {
-            fileSize = static_cast<std::size_t>(std::filesystem::file_size(std::filesystem::path(filePath)));
-        }
-
+        const std::size_t fileSize = fileContentLength(filePath);
         const std::size_t contentLength = request.body.size() + fileSize;
         const std::string headers = buildRequestHeaders(request, host, port, HttpScheme::Http, target, contentLength);
         sendAll(socketGuard.get(), headers);
 
-        if (!request.body.empty())
-            sendAll(socketGuard.get(), request.body);
-
-        if (!filePath.empty())
-        {
-            std::ifstream file(std::string(filePath), std::ios::binary);
-            if (!file)
-                throw std::runtime_error("Unable to open upload file: " + std::string(filePath));
-
-            sendStream(socketGuard.get(), file);
-        }
+        sendRequestPayload([&](std::string_view chunk)
+            {
+                sendAll(socketGuard.get(), chunk);
+            }, request, filePath);
 
         return receiveAll(socketGuard.get());
     }
@@ -898,12 +919,15 @@ namespace
         return body;
     }
 
-    std::string sendTlsRequestWinHttp(const HttpRequest& request,
+    std::string sendTlsRequestPlatform(const HttpRequest& request,
         std::string_view host,
         std::uint16_t port,
         std::string_view target,
+        std::string_view filePath,
         int timeoutMs)
     {
+        (void)filePath;
+
         struct HandleGuard
         {
             HINTERNET value = nullptr;
@@ -1028,7 +1052,7 @@ namespace
         return response;
     }
 
-    std::string sendTlsRequestOpenSsl(const HttpRequest& request,
+    std::string sendTlsRequestPlatform(const HttpRequest& request,
         std::string_view host,
         std::uint16_t port,
         std::string_view target,
@@ -1054,25 +1078,15 @@ namespace
         if (SSL_connect(sslGuard.get()) != 1)
             throw std::runtime_error("SSL_connect failed");
 
-        std::size_t fileSize = 0;
-        if (!filePath.empty())
-            fileSize = static_cast<std::size_t>(std::filesystem::file_size(std::filesystem::path(filePath)));
-
+        const std::size_t fileSize = fileContentLength(filePath);
         const std::size_t contentLength = request.body.size() + fileSize;
         const std::string headers = buildRequestHeaders(request, host, port, HttpScheme::Https, target, contentLength);
         sendAll(sslGuard.get(), headers);
 
-        if (!request.body.empty())
-            sendAll(sslGuard.get(), request.body);
-
-        if (!filePath.empty())
-        {
-            std::ifstream file(filePath.data(), std::ios::binary);
-            if (!file)
-                throw std::runtime_error("Unable to open upload file: " + std::string(filePath));
-
-            sendStream(sslGuard.get(), file);
-        }
+        sendRequestPayload([&](std::string_view chunk)
+            {
+                sendAll(sslGuard.get(), chunk);
+            }, request, filePath);
 
         return receiveAll(sslGuard.get());
     }
@@ -1085,12 +1099,7 @@ namespace
         std::string_view filePath,
         int timeoutMs)
     {
-#if defined(_WIN32)
-        (void)filePath;
-        return sendTlsRequestWinHttp(request, host, port, target, timeoutMs);
-#else
-        return sendTlsRequestOpenSsl(request, host, port, target, filePath, timeoutMs);
-#endif
+        return sendTlsRequestPlatform(request, host, port, target, filePath, timeoutMs);
     }
 
     HttpResponse parseResponse(std::string_view raw)
